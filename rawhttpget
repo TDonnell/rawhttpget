@@ -1,0 +1,281 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import socket
+from urlparse import urlparse
+from struct import *
+import random
+import re
+import time
+
+url = sys.argv[1]
+
+o = urlparse(url)
+
+dest_addr = socket.gethostbyname(o.netloc)
+
+#get machine ip by creating dummy UDP connection
+def getIP():
+	s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+	try:
+    		s.connect((socket.gethostbyname(o.netloc), 9))
+    		client = s.getsockname()[0]
+		print client
+	except socket.error:
+    		client = "Unknown IP"
+	finally:
+    		del s
+	return client
+
+#checksum calculator
+#exact same sample found in several locations.
+#honestly, kinda weird that everyone keeps quoting the
+#exact same code...
+
+def checksum(msg):
+    s = 0
+    # loop taking 2 characters at a time
+    for i in range(0, len(msg), 2):
+        w = ord(msg[i]) + (ord(msg[i+1]) << 8 )
+        s = s + w
+
+    s = (s>>16) + (s & 0xffff);
+
+    s = s + (s >> 16);
+
+    #complement and mask to 4 byte short
+    s = ~s & 0xffff
+
+    return s
+
+
+#data constructor
+def data_constructor():
+	tmp = ''
+	if o.path == '':
+		tmp = tmp + 'GET / HTTP/1.1\r\n'
+	else:
+		tmp = tmp + 'GET ' + o.path + ' HTTP/1.1\r\n'
+	tmp = tmp + 'Host: ' + o.netloc + '\r\n'
+	tmp = tmp + 'User-Agent: test\r\n'
+	tmp = tmp + 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*,q=0.8\r\n'
+	tmp = tmp + 'Accept-Language: en-US,en;q=0.5\r\n'
+	tmp = tmp + 'Accept-Encoding: chunked\r\n'
+	connection = 'Connection: keep-alive\r\n\r\n'
+	if len(tmp + connection) % 2 != 0:
+		connection = 'Connection:  keep-alive\r\n\r\n'
+	tmp = tmp + connection
+	return tmp
+
+#IP header construction
+def ip_header_constructor():
+	ip_version = 4
+	ip_ihl = 5
+	ip_dscp = 0
+	ip_len = 0
+	ip_id = 42
+	ip_offset = 0
+	ip_ttl = 100
+	ip_protocol = socket.IPPROTO_TCP
+	ip_checksum = 0
+	ip_dest = socket.inet_aton(socket.gethostbyname(o.netloc))
+	ip_src = socket.inet_aton(getIP())
+	
+	ip_version_ihl = (ip_version << 4) + ip_ihl
+
+	ip_header = pack('!BBHHHBBH4s4s',ip_version_ihl,ip_dscp, ip_len, ip_id, ip_offset, ip_ttl, ip_protocol, ip_checksum, ip_src, ip_dest)
+	ip_len = len(ip_header)	
+	ip_header = pack('!BBHHHBBH4s4s',ip_version_ihl,ip_dscp, ip_len, ip_id, ip_offset, ip_ttl, ip_protocol,ip_checksum,ip_src, ip_dest)
+	ip_checksum = checksum(ip_header)
+
+	ip_header = pack('!BBHHHBBH4s4s',ip_version_ihl,ip_dscp, ip_len, ip_id, ip_offset, ip_ttl, ip_protocol, ip_checksum, ip_src, ip_dest)
+	return ip_header
+
+#tcp header construction
+def tcp_header_constructor(data, syn, ack, fin, rst, seqnum, acknum,srcport):
+	tcp_srcport = srcport
+	tcp_destport = 80
+	tcp_seqnum = seqnum
+	tcp_acknum = acknum
+	tcp_dataoffset = 5
+	tcp_urg = 0
+	tcp_ack = ack
+	tcp_push = 0
+	tcp_rst = rst
+	tcp_syn = syn
+	tcp_fin = fin
+	tcp_windowsize = socket.htons(5000)
+	tcp_checksum = 0
+	tcp_urgent_ptr = 0
+
+	tcp_dataoffset = (tcp_dataoffset << 4) + 0
+	tcp_flags = tcp_fin + (tcp_syn << 1) + (tcp_rst << 2) + (tcp_push << 3) + (tcp_ack << 4) + (tcp_urg << 5)
+
+	#data = data_constructor()
+	#calculate checksum
+	tcp_header = pack('!HHLLBBHHH' , tcp_srcport, tcp_destport, tcp_seqnum, tcp_acknum, tcp_dataoffset, tcp_flags,  tcp_windowsize, tcp_checksum, tcp_urgent_ptr)
+
+	ip_src = socket.inet_aton(getIP())
+	ip_dest = socket.inet_aton(socket.gethostbyname(o.netloc))
+	placeholder = 0
+	protocol = socket.IPPROTO_TCP
+	tcp_length = len(tcp_header) + len(data)
+
+	#dummy ip header for generating tcp checksum
+	psh = pack('!4s4sBBH' , ip_src , ip_dest , placeholder , protocol , tcp_length);
+	psh = psh + tcp_header + data;
+	
+	tcp_check = checksum(psh)
+
+	# remake tcp header with checksum
+	tcp_header = pack('!HHLLBBH' , tcp_srcport, tcp_destport, tcp_seqnum, tcp_acknum, tcp_dataoffset, tcp_flags,  tcp_windowsize) + pack('H' , tcp_check) + pack('!H' , tcp_urgent_ptr)
+
+	return tcp_header
+
+def htmlParser(d):
+	#parses input URL into file name, path, etc.
+	text = d
+	if o.path.rfind('/') == (len(o.path)-1):
+#		'URL ends in /'
+		filename = 'index.html'
+	elif o.path == '':
+#		'URL has no path'
+		filename = 'index.html'
+	else:
+#		'URL file is unique'
+		filename = o.path[o.path.rfind('/')+1:]	
+	text = text[text.find('<html>'):text.find('</html>')+7]
+	if len(text) != 0:
+#		'writing to file'
+		f = open(filename, 'w')
+		f.write(text)
+		f.close()
+def getResponse(response):
+	ip_resp_header = response[0:20]
+
+	tcp_header_size = response[33]
+	tcp_header_size = unpack('!B',response[32])
+	tcp_header_size = tcp_header_size[0] / 4
+	tcp_resp_header = response[20:(20+tcp_header_size)]
+
+	data_resp = response[(20+tcp_header_size):]
+
+	(response_source) = unpack('!4s', ip_resp_header[12:16])
+	response_source = socket.inet_ntoa(response_source[0])
+	if response_source == socket.gethostbyname(o.netloc):
+		stuff = ''
+	ip_checksum = unpack('!H', ip_resp_header[10:12])
+	ip_comp_checksum = ip_resp_header[:10] + pack('!H', int(0)) + ip_resp_header[12:]	
+	ip_comp_checksum = checksum(ip_comp_checksum)
+	
+	(tcp_seqnum) = unpack('!L', tcp_resp_header[4:8])
+	(tcp_acknum) = unpack('!L', tcp_resp_header[8:12])
+
+	return tcp_seqnum[0], tcp_acknum[0], data_resp
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    s2 = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+    s2.settimeout(60)
+
+except socket.error , msg:
+    print 'Socket could not be created. Error Code : ' + str(msg[0]) + ' Message ' + msg[1]
+    sys.exit()
+
+	
+#main
+tcp_port_val = random.randrange(2000,10000)
+user_data = ''
+response_data = ''
+tmp = ''
+seqnum = random.randrange(0, 99999999)
+acknum = 0
+#handshake syn packet
+tcp = tcp_header_constructor('', 1, 0, 0, 0, seqnum, acknum,tcp_port_val)
+ip = ip_header_constructor()
+packet = ip + tcp
+
+s.sendto(packet, (dest_addr , 0 ))
+
+resp_seq, resp_ack, tmp = getResponse(s2.recv(5000))
+response_data += tmp
+tcp = tcp_header_constructor('', 0, 1, 0, 0, resp_ack, resp_seq+1,tcp_port_val)
+ip = ip_header_constructor()
+packet = ip + tcp
+s.sendto(packet, (dest_addr, 0 ))
+#handshake done
+
+user_data = data_constructor()
+
+#http request
+tcp = tcp_header_constructor(user_data, 0, 1, 0, 0, resp_ack, resp_seq+1,tcp_port_val)
+ip = ip_header_constructor()
+packet = ip + tcp + user_data
+s.sendto(packet, (dest_addr, 0 ))
+
+#http ack
+resp_seq, resp_ack, tmp = getResponse(s2.recv(5000))
+response_data += tmp
+answer = s2.recv(5000)
+while len(answer) != 0:
+	resp_seq, resp_ack, tmp = getResponse(answer)
+	response_data += tmp
+	#case: chunked data. 0 packet means end
+	if response_data.find('Transfer-Encoding: chunked') != -1:
+		if tmp.strip() == '0':
+			answer = ''
+			tcp = tcp_header_constructor('', 0, 1, 0, 0, resp_ack, resp_seq+len(tmp),tcp_port_val)
+			ip = ip_header_constructor()
+			packet = ip + tcp
+			s.sendto(packet, (dest_addr, 0 ))
+		else:
+			tcp = tcp_header_constructor('', 0, 1, 0, 0, resp_ack, resp_seq+len(tmp),tcp_port_val)
+			ip = ip_header_constructor()
+			packet = ip + tcp
+			s.sendto(packet, (dest_addr, 0 ))
+			answer = s2.recv(5000)
+		
+	elif response_data.find('Content-Length: ') != -1:
+		#case: non-chunked data. assuming final packet contains </html>
+		if response_data.find('</html>') != -1:
+			answer = ''
+			tcp = tcp_header_constructor('', 0, 1, 0, 0, resp_ack, resp_seq+len(tmp),tcp_port_val)
+			ip = ip_header_constructor()
+			packet = ip + tcp
+			s.sendto(packet, (dest_addr, 0 ))
+		else:
+			tcp = tcp_header_constructor('', 0, 1, 0, 0, resp_ack, resp_seq+len(tmp),tcp_port_val)
+			ip = ip_header_constructor()
+			packet = ip + tcp
+			s.sendto(packet, (dest_addr, 0 ))
+			answer = s2.recv(5000)
+	else:
+#ack
+		tcp = tcp_header_constructor('', 0, 1, 0, 0, resp_ack, resp_seq+len(tmp),tcp_port_val)
+		ip = ip_header_constructor()
+		packet = ip + tcp
+
+		s.sendto(packet, (dest_addr, 0 ))
+	
+		answer = s2.recv(5000)
+
+#fin packet
+tcp = tcp_header_constructor('', 0, 0, 1, 0, resp_ack, resp_seq+len(tmp),tcp_port_val)
+ip = ip_header_constructor()
+packet = ip + tcp
+s.sendto(packet, (dest_addr, 0 ))
+time.sleep(5)
+#fin-ack
+answer = s2.recv(5000)
+
+resp_seq, resp_ack, tmp = getResponse(answer)
+#ack
+tcp = tcp_header_constructor('', 0, 1, 0, 0, resp_ack+1, resp_seq+1,tcp_port_val)
+ip = ip_header_constructor()
+packet = ip + tcp
+s.sendto(packet, (dest_addr, 0 ))
+
+htmlParser(response_data)
+s.close()
+s2.close()
