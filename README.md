@@ -1,7 +1,7 @@
 rawhttpget
 ==========
 
-HTTP GET with raw socket
+HTTP GET with raw socket using Python
 
 
 Basic HTTP GET program, completed using a raw socket. There was no purpose in doing it this way, but I was curious.
